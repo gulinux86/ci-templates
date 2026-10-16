@@ -1,0 +1,72 @@
+# The three steps every AWS Terraform job starts with: pick the environment's role,
+# authenticate through OIDC, install Terraform.
+#
+# A composite action rather than a reusable workflow because it is steps, not a job:
+# it runs on the caller's runner, in the caller's workspace, and the credentials it
+# exports are there for the steps that follow. A reusable workflow would get its own
+# runner and the terraform command would find nothing.
+#
+# It also cannot declare `secrets:` — composite actions have no such block — so the
+# role ARNs arrive as inputs and the caller resolves `secrets.X` before passing them.
+name: aws-terraform-setup
+description: Assume an environment's AWS role via OIDC and install Terraform
+
+inputs:
+  environment:
+    description: Which environment's role to assume. Selects between the two ARNs below.
+    required: true
+  role:
+    description: >-
+      plan or deploy. The split is the point: a pull-request job must never hold a
+      credential that can write, because it runs the workflow file from its own branch.
+    required: true
+  plan-role-arn:
+    description: Read-only role ARN. Required when role is plan.
+    required: false
+    default: ""
+  deploy-role-arn:
+    description: Write role ARN. Required when role is deploy.
+    required: false
+    default: ""
+  aws-region:
+    required: false
+    default: us-east-1
+  terraform-version:
+    required: false
+    default: "~> 1.10"
+
+runs:
+  using: composite
+  steps:
+    - name: Select AWS role
+      shell: bash
+      env:
+        ROLE: ${{ inputs.role }}
+        PLAN_ARN: ${{ inputs.plan-role-arn }}
+        DEPLOY_ARN: ${{ inputs.deploy-role-arn }}
+      run: |
+        set -euo pipefail
+        case "$ROLE" in
+          plan)   ARN="$PLAN_ARN" ;;
+          deploy) ARN="$DEPLOY_ARN" ;;
+          *) echo "role must be 'plan' or 'deploy', got '$ROLE'" >&2; exit 1 ;;
+        esac
+
+        # An empty ARN would let configure-aws-credentials fail with something less
+        # obvious several steps later, or — worse — succeed as the wrong identity.
+        if [ -z "$ARN" ]; then
+          echo "no ARN supplied for role '$ROLE'; the caller must pass ${ROLE}-role-arn" >&2
+          exit 1
+        fi
+        echo "AWS_ROLE_ARN=$ARN" >> "$GITHUB_ENV"
+
+    - name: Configure AWS credentials (OIDC)
+      uses: aws-actions/configure-aws-credentials@e7f100cf4c008499ea8adda475de1042d6975c7b # v6.2.0
+      with:
+        role-to-assume: ${{ env.AWS_ROLE_ARN }}
+        aws-region: ${{ inputs.aws-region }}
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+      with:
+        terraform_version: ${{ inputs.terraform-version }}
