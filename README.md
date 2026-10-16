@@ -8,7 +8,7 @@ A composite action for the three steps every AWS Terraform job starts with: sele
 environment's role, authenticate through OIDC, install Terraform.
 
 ```yaml
-- uses: gulinux86/ci-templates/.github/actions/aws-terraform-setup@main
+- uses: gulinux86/ci-templates/.github/actions/aws-terraform-setup@master
   with:
     environment: hml
     role: deploy                    # or plan
@@ -43,6 +43,6 @@ This action is generic because its job is small: assume a role, install a binary
 
 - [`eks-terraform`](https://github.com/gulinux86/eks-terraform) — plan, deploy, destroy
 
-Pinned to `@main` while the first consumer validates it. Tag `v1` once a full
-deploy/destroy cycle has passed through it, and move consumers to the tag — `@main`
+Pinned to `@master` while the first consumer validates it. Tag `v1` once a full
+deploy/destroy cycle has passed through it, and move consumers to the tag — `@master`
 propagates a mistake to every consumer at once with no way to pin out.
