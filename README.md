@@ -8,12 +8,22 @@ A composite action for the three steps every AWS Terraform job starts with: sele
 environment's role, authenticate through OIDC, install Terraform.
 
 ```yaml
-- uses: gulinux86/ci-templates/.github/actions/aws-terraform-setup@master
+- uses: gulinux86/ci-templates/.github/actions/aws-terraform-setup@<sha>  # pre-v1
   with:
     environment: hml
     role: deploy                    # or plan
     deploy-role-arn: ${{ secrets.HML_DEPLOY_ROLE_ARN }}
 ```
+
+**Pin by commit SHA, not by tag or branch.** A tag is mutable — whoever controls this
+repository can repoint `v1` at different code, and a consumer would run it with no
+diff anywhere. That is not hypothetical: `tj-actions/changed-files` was compromised
+in 2025 by exactly that, with tags repointed at code that leaked secrets. A SHA
+cannot move.
+
+The version goes in a trailing comment so a human can read what the SHA is, which is
+the convention the consuming workflows already follow for `actions/checkout` and the
+rest.
 
 **Why a composite action and not a reusable workflow.** It is steps, not a job: it
 runs on the caller's runner, in the caller's workspace, and the credentials it exports
@@ -43,6 +53,6 @@ This action is generic because its job is small: assume a role, install a binary
 
 - [`eks-terraform`](https://github.com/gulinux86/eks-terraform) — plan, deploy, destroy
 
-Pinned to `@master` while the first consumer validates it. Tag `v1` once a full
-deploy/destroy cycle has passed through it, and move consumers to the tag — `@master`
-propagates a mistake to every consumer at once with no way to pin out.
+Consumers pin the current commit while this is validated. Tag `v1` once a full
+deploy/destroy cycle has passed through it — the tag is for humans reading the
+comment; the SHA is what is resolved.
