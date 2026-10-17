@@ -11,10 +11,11 @@
 name: aws-terraform-setup
 description: Assume an environment's AWS role via OIDC and install Terraform
 
+# There is no `environment` input. There used to be one, required and documented as
+# selecting between the ARNs — it was never read. `role` selects, and the caller
+# picks the environment's ARN when it resolves `secrets.X`. An input that changes
+# nothing tells every reader of a call site something false.
 inputs:
-  environment:
-    description: Which environment's role to assume. Selects between the two ARNs below.
-    required: true
   role:
     description: >-
       plan or deploy. The split is the point: a pull-request job must never hold a
