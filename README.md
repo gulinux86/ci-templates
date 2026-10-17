@@ -10,7 +10,6 @@ environment's role, authenticate through OIDC, install Terraform.
 ```yaml
 - uses: gulinux86/ci-templates/.github/actions/aws-terraform-setup@<sha>  # pre-v1
   with:
-    environment: hml
     role: deploy                    # or plan
     deploy-role-arn: ${{ secrets.HML_DEPLOY_ROLE_ARN }}
 ```
