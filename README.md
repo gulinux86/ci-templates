@@ -53,6 +53,25 @@ This action is generic because its job is small: assume a role, install a binary
 
 - [`eks-terraform`](https://github.com/gulinux86/eks-terraform) — plan, deploy, destroy
 
+### Deliberately out of scope
+
+`aks-terraform` and `gcp-serverless-platform-terraform` are Azure and GCP. Different
+auth entirely, so this action is useless to them — sharing CI across clouds would mean
+an action whose only shared step is installing Terraform.
+
+Two sibling AWS projects (`aws-plataform-terraform`, `aws-platform-apps`) could adopt
+this. Neither has been read, so neither is claimed as a consumer: a template justified
+by projects nobody checked is shared infrastructure for an assumption.
+
+## What stayed with the consumer, and why
+
+Reusable workflows were tried here and moved back. The ones worth sharing turned out
+to carry decisions specific to one platform — layer ordering, a cross-layer output
+contract, a teardown shaped by nine corrections — and a workflow needing six inputs to
+describe someone else's architecture is not shared logic.
+
+What is left is small enough to stay generic: assume a role, install a binary.
+
 Consumers pin the current commit while this is validated. Tag `v1` once a full
 deploy/destroy cycle has passed through it — the tag is for humans reading the
 comment; the SHA is what is resolved.
