@@ -84,7 +84,10 @@ jobs:
 ```
 
 The application must already be onboarded — `apps/<app>/values.yaml` in app-gitops and
-its tenant in platform-gitops. The workflow refuses to invent a values file.
+its tenant in platform-gitops. The workflow refuses to invent a values file: a first
+push before onboarding builds and pushes the image, then fails at the pull request with
+"onboard the application there first". Onboard with that image's digest, and every
+push after opens the release pull request.
 
 **What it decides, and why:**
 
@@ -114,7 +117,10 @@ its tenant in platform-gitops. The workflow refuses to invent a values file.
    [`eks-terraform`](https://github.com/gulinux86/eks-terraform) creates
    `github-actions-ecr-push` (assumable from the `main` branch of your repositories) and
    `github-actions-ecr-read` (for app-gitops' CI). Outputs `ecr_push_role_arn` and
-   `ecr_read_role_arn`.
+   `ecr_read_role_arn`. Their trust accepts both OIDC `sub` formats GitHub issues —
+   newer repositories get the immutable `repo:<owner>@<id>/<repo>@<id>` one, and a
+   trust without it fails with `Not authorized to perform
+   sts:AssumeRoleWithWebIdentity`.
 2. **GitHub App** — Settings → Developer settings → GitHub Apps → New:
    - no webhook; repository permissions **Contents: Read and write** and **Pull
      requests: Read and write**, nothing else;
@@ -143,7 +149,9 @@ pipeline, and what differs between them is one name.
 
 - [`eks-terraform`](https://github.com/gulinux86/eks-terraform) — plan, deploy, destroy
   (`aws-terraform-setup`)
-- application repositories deployed through app-gitops (`service-release`)
+- application repositories deployed through app-gitops (`service-release`) —
+  [`hello-api`](https://github.com/gulinux86/hello-api) is the reference: its
+  `.github/workflows/release.yml` is the caller above, nothing more
 
 ### Deliberately out of scope
 
