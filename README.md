@@ -1,6 +1,12 @@
 # ci-templates
 
-Shared GitHub Actions building blocks for Terraform on AWS.
+Shared GitHub Actions building blocks: Terraform on AWS, and releasing a service to
+the EKS platform.
+
+| | Kind | For |
+|---|---|---|
+| [`aws-terraform-setup`](#aws-terraform-setup) | composite action | Terraform jobs: OIDC role + Terraform |
+| [`service-release`](#service-release) | reusable workflow | application repositories: image to ECR, digest to app-gitops |
 
 ## `aws-terraform-setup`
 
@@ -38,19 +44,106 @@ needs to read must never hold a credential that can write. Passing `role: plan`
 against a read-only ARN keeps that explicit at every call site, and an empty ARN fails
 loudly rather than authenticating as something unintended.
 
+## `service-release`
+
+Takes a service from a commit on `main` to a pull request in
+[`app-gitops`](https://github.com/gulinux86/app-gitops) that deploys it:
+
+```
+pull request   build → scan (Trivy)                                   nothing pushed
+push to main   build → scan → push to ECR apps/<app>[/<service>]
+               → PR in app-gitops: image: <registry>/apps/<app>:<sha>@sha256:… in
+                 apps/<app>[/<service>]/values.yaml
+               → app-gitops CI validates it → merge (or auto-merge) → Argo CD deploys
+```
+
+In the application's repository, `.github/workflows/release.yml`:
+
+```yaml
+name: release
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  release:
+    uses: gulinux86/ci-templates/.github/workflows/service-release.yml@<sha>  # pre-v1
+    permissions:
+      contents: read
+      id-token: write
+    with:
+      app: orders            # apps/orders/ in app-gitops, ECR apps/orders
+      # service: api         # apps/orders/api/ for a multi-service application
+      # auto-merge: true     # merge the app-gitops PR when its checks pass
+    secrets:
+      ecr-push-role-arn: ${{ secrets.ECR_PUSH_ROLE_ARN }}
+      gitops-app-client-id: ${{ secrets.GITOPS_APP_CLIENT_ID }}
+      gitops-app-private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+```
+
+The application must already be onboarded — `apps/<app>/values.yaml` in app-gitops and
+its tenant in platform-gitops. The workflow refuses to invent a values file.
+
+**What it decides, and why:**
+
+- **The tag is the commit** (12 characters), and ECR tags are immutable, so a tag names
+  one build forever. The pull request pins the digest as well; the tag is for humans.
+- **The ECR repository is created on the first push**, with immutable tags, scan on
+  push and a lifecycle policy keeping the newest 200 images. Not by Terraform: images
+  must outlive the cluster, and admitting an application should not need an apply.
+- **Scan before push.** A HIGH or CRITICAL vulnerability with a fix available fails the
+  build before the image exists anywhere. Unfixed ones do not: they would block every
+  release with nothing the team can do. Trivy is installed from its release asset with
+  a pinned checksum, not through `setup-trivy`, whose tag lookup has failed for hours
+  at a time.
+- **Two jobs, two credentials.** `build` holds the ECR push role and no token for
+  app-gitops; `promote` holds that token and no AWS credentials. A pull request runs
+  neither the push nor the promote.
+- **A GitHub App, not `GITHUB_TOKEN` or a personal token.** The workflow's own token
+  cannot write to another repository, and a pull request it opened would not start
+  app-gitops' CI. An App token is scoped to app-gitops alone and expires in an hour.
+- **Releases are serialized per service, and supersede each other.** A newer release
+  closes the older open release PRs of the same service; merging one of those after
+  would roll the service back.
+
+### One-time setup
+
+1. **AWS roles** — `terraform -chdir=bootstrap apply` in
+   [`eks-terraform`](https://github.com/gulinux86/eks-terraform) creates
+   `github-actions-ecr-push` (assumable from the `main` branch of your repositories) and
+   `github-actions-ecr-read` (for app-gitops' CI). Outputs `ecr_push_role_arn` and
+   `ecr_read_role_arn`.
+2. **GitHub App** — Settings → Developer settings → GitHub Apps → New:
+   - no webhook; repository permissions **Contents: Read and write** and **Pull
+     requests: Read and write**, nothing else;
+   - install it on **app-gitops only**;
+   - note its **Client ID** and generate a **private key**.
+3. **Secrets**
+   - each application repository: `ECR_PUSH_ROLE_ARN`, `GITOPS_APP_CLIENT_ID`,
+     `GITOPS_APP_PRIVATE_KEY`;
+   - app-gitops: `ECR_READ_ROLE_ARN`.
+4. **For `auto-merge: true`** — in app-gitops, enable *Allow auto-merge* and protect
+   `main` with its CI jobs as required checks. Without required checks, auto-merge
+   would merge before CI has said anything.
+
 ## What is deliberately not here
 
-Reusable workflows. They were tried here and moved back to the consuming repository,
-because the ones worth sharing turned out to carry project-specific decisions — layer
-ordering, a cross-layer output contract, a teardown shaped by nine corrections
-particular to one platform. A workflow that needs six inputs to describe someone
-else's architecture is not shared logic.
+Terraform pipelines as reusable workflows. They were tried here and moved back to the
+consuming repository, because the ones worth sharing turned out to carry
+project-specific decisions — layer ordering, a cross-layer output contract, a teardown
+shaped by nine corrections particular to one platform. A workflow that needs six inputs
+to describe someone else's architecture is not shared logic.
 
-This action is generic because its job is small: assume a role, install a binary.
+`service-release` is the opposite case: every application repository runs the same
+pipeline, and what differs between them is one name.
 
 ## Consumers
 
 - [`eks-terraform`](https://github.com/gulinux86/eks-terraform) — plan, deploy, destroy
+  (`aws-terraform-setup`)
+- application repositories deployed through app-gitops (`service-release`)
 
 ### Deliberately out of scope
 
@@ -64,12 +157,13 @@ by projects nobody checked is shared infrastructure for an assumption.
 
 ## What stayed with the consumer, and why
 
-Reusable workflows were tried here and moved back. The ones worth sharing turned out
-to carry decisions specific to one platform — layer ordering, a cross-layer output
+Terraform reusable workflows were tried here and moved back. The ones worth sharing
+turned out to carry decisions specific to one platform — layer ordering, a cross-layer output
 contract, a teardown shaped by nine corrections — and a workflow needing six inputs to
 describe someone else's architecture is not shared logic.
 
-What is left is small enough to stay generic: assume a role, install a binary.
+What is left of the Terraform side is small enough to stay generic: assume a role,
+install a binary.
 
 Consumers pin the current commit while this is validated. Tag `v1` once a full
 deploy/destroy cycle has passed through it — the tag is for humans reading the

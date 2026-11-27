@@ -1,0 +1,370 @@
+# Build, scan and publish a service's image, then propose it to app-gitops.
+#
+#   pull request  build + scan. Nothing is pushed: a branch never holds the push role,
+#                 so an image a reviewer has not seen cannot reach a digest PR.
+#   push to main  build + scan + push to ECR apps/<app>[/<service>] (the repository is
+#                 created on the first push), then a pull request in app-gitops that
+#                 pins the new digest in apps/<app>[/<service>]/values.yaml.
+#
+# app-gitops' CI validates that pull request like any other — schema, chart guards,
+# the image read back from ECR — and Argo CD deploys it once merged. With
+# `auto-merge: true` it merges itself when those checks pass.
+#
+# A reusable workflow rather than a composite action, unlike aws-terraform-setup:
+# this is two jobs with different credentials. The build job holds the ECR push role
+# and never a GitHub token for app-gitops; the promote job holds that token and never
+# AWS credentials.
+#
+# Caller (in the application's repository):
+#
+#   on:
+#     push: { branches: [main] }
+#     pull_request:
+#   permissions: { contents: read }
+#   jobs:
+#     release:
+#       uses: gulinux86/ci-templates/.github/workflows/service-release.yml@<sha>
+#       permissions: { contents: read, id-token: write }
+#       with:
+#         app: orders
+#       secrets:
+#         ecr-push-role-arn: ${{ secrets.ECR_PUSH_ROLE_ARN }}
+#         gitops-app-client-id: ${{ secrets.GITOPS_APP_CLIENT_ID }}
+#         gitops-app-private-key: ${{ secrets.GITOPS_APP_PRIVATE_KEY }}
+name: service-release
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: >-
+          The application's name in app-gitops (apps/<app>/) and in the platform's
+          tenant registry. Also its ECR repository, apps/<app>.
+        type: string
+        required: true
+      service:
+        description: >-
+          For an application with several services: which one this repository
+          builds. Values in apps/<app>/<service>/values.yaml, image in
+          apps/<app>/<service>. Empty for a single-service application.
+        type: string
+        required: false
+        default: ""
+      context:
+        description: Docker build context.
+        type: string
+        required: false
+        default: "."
+      dockerfile:
+        type: string
+        required: false
+        default: Dockerfile
+      aws-region:
+        type: string
+        required: false
+        default: us-east-1
+      gitops-repository:
+        description: The application GitOps repository, as owner/name.
+        type: string
+        required: false
+        default: gulinux86/app-gitops
+      auto-merge:
+        description: >-
+          Enable auto-merge on the app-gitops pull request, so it merges when its
+          required checks pass. Needs "Allow auto-merge" and a branch protection rule
+          with required checks on that repository.
+        type: boolean
+        required: false
+        default: false
+      scan-severity:
+        description: >-
+          Image vulnerabilities at these severities, with a fix available, fail the
+          build before anything is pushed.
+        type: string
+        required: false
+        default: CRITICAL,HIGH
+    secrets:
+      ecr-push-role-arn:
+        description: The ECR push role (eks-terraform bootstrap, output ecr_push_role_arn). Needed on push to main.
+        required: false
+      gitops-app-client-id:
+        description: Client ID of the GitHub App installed on the GitOps repository.
+        required: false
+      gitops-app-private-key:
+        description: That App's private key.
+        required: false
+    outputs:
+      image:
+        description: The pushed image, <registry>/<repository>:<tag>@<digest>. Empty when nothing was pushed.
+        value: ${{ jobs.build.outputs.image }}
+
+permissions:
+  contents: read
+
+env:
+  # Installed from the release asset with a pinned checksum rather than through
+  # aquasecurity/setup-trivy, whose install script resolves the tag through a GitHub
+  # page that has been seen returning 504 for hours (eks-terraform PR #104).
+  TRIVY_VERSION: 0.70.0
+  TRIVY_SHA256: 8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    steps:
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+
+      - name: Names
+        id: names
+        env:
+          APP: ${{ inputs.app }}
+          SERVICE: ${{ inputs.service }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          NAME_RE='^[a-z0-9]([a-z0-9-]*[a-z0-9])?$'
+          [[ "$APP" =~ $NAME_RE ]] || { echo "::error::app '$APP' must be lowercase letters, digits and hyphens"; exit 1; }
+          if [ -n "$SERVICE" ]; then
+            [[ "$SERVICE" =~ $NAME_RE ]] || { echo "::error::service '$SERVICE' must be lowercase letters, digits and hyphens"; exit 1; }
+            REPOSITORY="apps/$APP/$SERVICE"
+          else
+            REPOSITORY="apps/$APP"
+          fi
+          # The commit, shortened: immutable in ECR, so a tag always names one build.
+          TAG="${GITHUB_SHA::12}"
+          PUSH=false
+          if [ "$EVENT" = push ] && [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
+            PUSH=true
+          fi
+          {
+            echo "repository=$REPOSITORY"
+            echo "tag=$TAG"
+            echo "push=$PUSH"
+          } >>"$GITHUB_OUTPUT"
+          echo "repository=$REPOSITORY tag=$TAG push=$PUSH"
+
+      - name: Build
+        env:
+          REPOSITORY: ${{ steps.names.outputs.repository }}
+          TAG: ${{ steps.names.outputs.tag }}
+          CONTEXT: ${{ inputs.context }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # linux/amd64: the nodes Karpenter launches.
+          docker build --platform linux/amd64 \
+            --label "org.opencontainers.image.source=$SOURCE" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            -f "$DOCKERFILE" -t "local/$REPOSITORY:$TAG" "$CONTEXT"
+
+      - name: Install Trivy
+        run: |
+          set -euo pipefail
+          TARBALL="trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          curl -sSfLo "$RUNNER_TEMP/$TARBALL" \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${TARBALL}"
+          echo "${TRIVY_SHA256}  $RUNNER_TEMP/$TARBALL" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$TARBALL" -C "$RUNNER_TEMP" trivy
+          sudo install "$RUNNER_TEMP/trivy" /usr/local/bin/trivy
+
+      # Before the push, so a vulnerable image never reaches the registry. Only what
+      # has a fix fails the build: an unfixed CVE would block every release with
+      # nothing the team can do about it.
+      - name: Scan
+        env:
+          IMAGE: local/${{ steps.names.outputs.repository }}:${{ steps.names.outputs.tag }}
+          SEVERITY: ${{ inputs.scan-severity }}
+        run: |
+          trivy image --no-progress --ignore-unfixed --exit-code 1 \
+            --severity "$SEVERITY" "$IMAGE"
+
+      - name: AWS credentials (OIDC)
+        if: steps.names.outputs.push == 'true'
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.ecr-push-role-arn }}
+          aws-region: ${{ inputs.aws-region }}
+
+      - name: Push
+        id: push
+        if: steps.names.outputs.push == 'true'
+        env:
+          REPOSITORY: ${{ steps.names.outputs.repository }}
+          TAG: ${{ steps.names.outputs.tag }}
+          REGION: ${{ inputs.aws-region }}
+        run: |
+          set -euo pipefail
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY="$ACCOUNT.dkr.ecr.$REGION.amazonaws.com"
+
+          # The repository is created on the first push, not by Terraform: it must
+          # outlive the cluster, and admitting an application should not need an apply.
+          # Immutable tags, so a digest app-gitops pins can never be re-pointed; scan on
+          # push, so ECR keeps reporting CVEs found after this build.
+          if ! aws ecr describe-repositories --repository-names "$REPOSITORY" >/dev/null 2>&1; then
+            echo "creating ECR repository $REPOSITORY"
+            aws ecr create-repository --repository-name "$REPOSITORY" \
+              --image-tag-mutability IMMUTABLE \
+              --image-scanning-configuration scanOnPush=true \
+              --encryption-configuration encryptionType=AES256 \
+              --tags "Key=ManagedBy,Value=service-release" "Key=Source,Value=$GITHUB_REPOSITORY" >/dev/null
+            # The newest 200 images stay. Far more than any rollback reaches back, and
+            # an image older than that pinned by a running Deployment is a release
+            # nobody has touched in 200 builds.
+            aws ecr put-lifecycle-policy --repository-name "$REPOSITORY" --lifecycle-policy-text '{
+              "rules": [{
+                "rulePriority": 1,
+                "description": "keep the newest 200 images",
+                "selection": {"tagStatus": "any", "countType": "imageCountMoreThan", "countNumber": 200},
+                "action": {"type": "expire"}
+              }]
+            }' >/dev/null
+          fi
+
+          aws ecr get-login-password | docker login --username AWS --password-stdin "$REGISTRY"
+
+          # A re-run of the same commit finds its tag already there; immutable tags
+          # would refuse the push, and the image is the same build.
+          if aws ecr describe-images --repository-name "$REPOSITORY" --image-ids "imageTag=$TAG" >/dev/null 2>&1; then
+            echo "$REPOSITORY:$TAG already pushed; reusing it"
+          else
+            docker tag "local/$REPOSITORY:$TAG" "$REGISTRY/$REPOSITORY:$TAG"
+            docker push "$REGISTRY/$REPOSITORY:$TAG"
+          fi
+          DIGEST=$(aws ecr describe-images --repository-name "$REPOSITORY" --image-ids "imageTag=$TAG" \
+            --query 'imageDetails[0].imageDigest' --output text)
+          IMAGE="$REGISTRY/$REPOSITORY:$TAG@$DIGEST"
+          echo "image=$IMAGE" >>"$GITHUB_OUTPUT"
+          echo "### Pushed \`$IMAGE\`" >>"$GITHUB_STEP_SUMMARY"
+
+  promote:
+    needs: build
+    if: needs.build.outputs.image != ''
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    # One release of an application at a time, in order: a later commit's pull
+    # request must not be opened before an earlier one's.
+    concurrency:
+      group: service-release-${{ inputs.gitops-repository }}-${{ inputs.app }}-${{ inputs.service }}
+      cancel-in-progress: false
+    steps:
+      - name: Repository name
+        id: repo
+        env:
+          GITOPS: ${{ inputs.gitops-repository }}
+        run: |
+          echo "owner=${GITOPS%%/*}" >>"$GITHUB_OUTPUT"
+          echo "name=${GITOPS#*/}" >>"$GITHUB_OUTPUT"
+
+      # A token for the GitOps repository alone, valid for an hour. A pull request
+      # opened with the workflow's own GITHUB_TOKEN would not start app-gitops' CI;
+      # one opened by an App does.
+      - name: GitOps token
+        id: token
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ secrets.gitops-app-client-id }}
+          private-key: ${{ secrets.gitops-app-private-key }}
+          owner: ${{ steps.repo.outputs.owner }}
+          repositories: ${{ steps.repo.outputs.name }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - uses: actions/checkout@9f698171ed81b15d1823a05fc7211befd50c8ae0 # v6.0.3
+        with:
+          repository: ${{ inputs.gitops-repository }}
+          token: ${{ steps.token.outputs.token }}
+          path: gitops
+
+      - name: Pin the new image
+        id: pin
+        working-directory: gitops
+        env:
+          APP: ${{ inputs.app }}
+          SERVICE: ${{ inputs.service }}
+          IMAGE: ${{ needs.build.outputs.image }}
+        run: |
+          set -euo pipefail
+          if [ -n "$SERVICE" ]; then
+            FILE="apps/$APP/$SERVICE/values.yaml"
+            SLUG="$APP-$SERVICE"
+          else
+            FILE="apps/$APP/values.yaml"
+            SLUG="$APP"
+          fi
+          if [ ! -f "$FILE" ]; then
+            echo "::error::$FILE is not in the GitOps repository: onboard the application there first (its values file, and its tenant in platform-gitops)"
+            exit 1
+          fi
+          # Only the top-level `image:` key; a nested one (a sidecar, an init
+          # container) is not the service's own.
+          COUNT=$(grep -c '^image:' "$FILE" || true)
+          if [ "$COUNT" != 1 ]; then
+            echo "::error::$FILE has $COUNT top-level image: lines; expected exactly one"
+            exit 1
+          fi
+          sed -i "s|^image:.*|image: $IMAGE|" "$FILE"
+          if git diff --quiet; then
+            echo "$FILE already pins $IMAGE"
+            echo "changed=false" >>"$GITHUB_OUTPUT"
+            exit 0
+          fi
+          {
+            echo "changed=true"
+            echo "file=$FILE"
+            echo "slug=$SLUG"
+          } >>"$GITHUB_OUTPUT"
+
+      - name: Open the pull request
+        if: steps.pin.outputs.changed == 'true'
+        working-directory: gitops
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          GITOPS: ${{ inputs.gitops-repository }}
+          FILE: ${{ steps.pin.outputs.file }}
+          SLUG: ${{ steps.pin.outputs.slug }}
+          IMAGE: ${{ needs.build.outputs.image }}
+          AUTO_MERGE: ${{ inputs.auto-merge }}
+          SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_SHA::12}"
+          BRANCH="release/$SLUG/$TAG"
+          git config user.name "service-release"
+          git config user.email "service-release@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git commit -qam "release($SLUG): $TAG" -m "From $SOURCE/commit/$GITHUB_SHA"
+          git push -q origin "$BRANCH"
+
+          BODY=$(printf '%s\n' \
+            "Pins \`$IMAGE\` in \`$FILE\`." \
+            "" \
+            "- Source: $SOURCE/commit/$GITHUB_SHA" \
+            "- Build, scan and push: $RUN" \
+            "" \
+            "Opened by ci-templates' service-release workflow.")
+          URL=$(gh pr create --repo "$GITOPS" --head "$BRANCH" --base main \
+            --title "release($SLUG): $TAG" --body "$BODY")
+          echo "### Opened $URL" >>"$GITHUB_STEP_SUMMARY"
+
+          # Older release pull requests of this service are superseded: merging one
+          # after this would roll the service back.
+          gh pr list --repo "$GITOPS" --state open --json number,headRefName \
+            -q ".[] | select(.headRefName | startswith(\"release/$SLUG/\")) | select(.headRefName != \"$BRANCH\") | .number" |
+            while read -r OLD; do
+              gh pr close "$OLD" --repo "$GITOPS" --delete-branch --comment "Superseded by $URL."
+            done
+
+          if [ "$AUTO_MERGE" = true ]; then
+            gh pr merge "$URL" --auto --squash --delete-branch
+          fi
